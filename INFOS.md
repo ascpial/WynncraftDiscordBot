@@ -17,9 +17,9 @@
 `https://cdn.wynncraft.com/nextgen/skill/{skill}_book.svg` (skill book)
 
 I will need a way to convert SVG into PNG.
-One solution is to use custom emojis.
+One solution is to use custom emojis, as you can use them both in embeds text and use the image link in embed images (like thumbnail).
+This solution is good because you don't need to host a webserver or use a crappy website.
 I think there could be default values but I will put an option to create the emojis on a specified server.
-This will maybe be done in the future.
 
 # Time (e.g. join)
 
@@ -51,11 +51,11 @@ This are the structure of the embeds I'm looking for.
       "color": 12233344,
       "fields": [
         {
-          "name": ":dagger: Assassin",
+          "name": "<:assassin:1047260394227499098> Assassin",
           "value": "Combat: 38\nTotal: 103"
         },
         {
-          "name": ":axe: Warrior",
+          "name": "<:warrior:1047261013621346366> Warrior",
           "value": "Combat: 15\nTotal: 38"
         }
       ],
