@@ -18,7 +18,9 @@ def start():
     @bot.event
     async def on_ready():
         await bot.load_extension("ext.wynncraft")
-        await bot.tree.sync()
+        cog = bot.get_cog("Wynncraft")
+        await cog.refresh.start()
+        #await bot.tree.sync()
     
     bot.run()
 

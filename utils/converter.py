@@ -31,3 +31,8 @@ def convert_timedelta(time: datetime.timedelta) -> str:
         days = time.total_seconds() // 3600 // 24
         hours = time.total_seconds() // 3600 - days * 24
         return f"{int(days)} days and {int(hours)} hours"
+
+if __name__ == "__main__":
+    convert_svg_to_png("https://cdn.wynncraft.com/nextgen/classes/icons/archer.svg", "./archer.png")
+    convert_svg_to_png("https://cdn.wynncraft.com/nextgen/classes/icons/mage.svg", "./mage.png")
+    convert_svg_to_png("https://cdn.wynncraft.com/nextgen/classes/icons/shaman.svg", "./shaman.png")

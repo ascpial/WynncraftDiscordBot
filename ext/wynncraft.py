@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Optional, Iterator
+from typing import Optional, Generator, Union
 import urllib.error # to catch 400 errors (user does not exists)
 import datetime
+import log
 
 import discord
 from discord.ext import commands
+from discord.ext import tasks
 from discord import app_commands
 
 import wynncraft
@@ -17,6 +19,9 @@ from utils import Client, Storage, convert_timedelta
 EMOJIS = {
     "assassin": "<:assassin:1047260394227499098>",
     "warrior": "<:warrior:1047261013621346366>",
+    "archer": "<:archer:1047429598075437108>",
+    "mage": "<:mage:1047429596926201906>",
+    "shaman": "<:shaman:1047429595323965451>",
 }
 
 class Targets:
@@ -28,7 +33,7 @@ class Targets:
     def raw_targets(self) -> list[dict]:
         return self.player.data.get("targets", [])
 
-    async def get_target(self, index: int) -> discord.abc.Messageable | None:
+    async def get_target(self, index: int) -> discord.TextChannel | discord.DMChannel | None:
         data = self.raw_targets[index]
 
         type = data.get("type", 0)
@@ -49,7 +54,9 @@ class Targets:
             
             return user.dm_channel
 
-    async def __iter__(self) -> Iterator[discord.abc.Messageable]:
+    async def __iter__(
+        self
+    ) -> Generator[Union[discord.TextChannel, discord.DMChannel]]:
         failed = []
 
         for n in range(len(self.raw_targets)):
@@ -159,6 +166,7 @@ class Player:
     def __init__(self, data: dict, parent: Players):
         self.data = data
         self.parent = parent
+        self.targets = Targets(self)
         self.load_stats()
 
     def load_stats(self):
@@ -217,7 +225,7 @@ class Player:
     def get_large_embed(self) -> discord.Embed:
         embed = self.get_embed()
         embed.description += """
-        
+
         **Characters**"""
 
         for i, class_ in enumerate(self.stats.classes):
@@ -241,6 +249,10 @@ class Players(Storage):
         self.cog = cog
     
     def add_player(self, player: Player):
+        for player in self.data:
+            if player.get("uuid") == player.uuid:
+                raise ValueError("A user with this UUID already exists")
+
         self.data.append(player.data)
         self.players.append(player)
 
@@ -383,15 +395,25 @@ class PlayerCommandGroup(app_commands.Group):
             await inter.edit_original_response(
                 content=":negative_squared_cross_mark: The player could not be found.",
             )
-        else:
+            return
+        
+        try:
             self.players.add_player(player)
+        except ValueError: # the player already exists
+            for player_ in self.players:
+                if player.uuid == player_.uuid:
+                    await inter.edit_original_response(
+                        content=":negative_squared_cross_mark: The player already exists.",
+                        embed=player_.get_large_embed(),
+                    )
+                    return
 
-            self.players.save()
+        self.players.save()
 
-            await inter.edit_original_response(
-                content=":white_check_mark: The player has been created!",
-                embed=player.get_large_embed(),
-            )
+        await inter.edit_original_response(
+            content=":white_check_mark: The player has been created!",
+            embed=player.get_large_embed(),
+        )
 
 class Wynncraft(commands.Cog):
     def __init__(
@@ -405,7 +427,36 @@ class Wynncraft(commands.Cog):
 
         self.player_commands = PlayerCommandGroup(self.bot, self)
         self.bot.tree.add_command(self.player_commands)
+
+        self.current_player_index = 0
     
+    @tasks.loop(seconds=5)
+    async def refresh(self):
+        """Refresh one player at a time."""
+        if len(self.players.players) > self.current_player_index:
+            player = self.players.players[self.current_player_index]
+            
+            was_online = player.stats.online
+
+            player.refresh()
+
+            log.info(f"Player {player.name} refreshed")
+
+            if was_online is not player.stats.online: # the user connected or disconnected
+                if player.stats.online:
+                    message = f"{player.name} just logged into {player.stats.server}!"
+                else:
+                    message = f"{player.name} logged out."
+                embed = await player.get_embed()
+                for channel in player.targets:
+                    await channel.send(
+                        content=message,
+                        embed=embed,
+                    )
+            
+            self.current_player_index += 1
+            if self.current_player_index >= len(self.players.players):
+                self.current_player_index = 0
 
 async def setup(bot: Client):
     await bot.add_cog(Wynncraft(bot))
