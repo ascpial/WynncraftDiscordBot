@@ -12,7 +12,7 @@ def start():
 
     bot = Client(
         config=config,
-        #proxy="http://172.19.255.254:3128"
+        proxy="http://172.19.255.254:3128",
     )
 
     @bot.event

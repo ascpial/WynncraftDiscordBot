@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional, Iterator
 import urllib.error # to catch 400 errors (user does not exists)
+import datetime
 
 import discord
 from discord.ext import commands
@@ -11,7 +12,12 @@ from discord import app_commands
 
 import wynncraft
 
-from utils import Client, Storage
+from utils import Client, Storage, convert_timedelta
+
+EMOJIS = {
+    "assassin": "<:assassin:1047260394227499098>",
+    "warrior": "<:warrior:1047261013621346366>",
+}
 
 class Targets:
     def __init__(self, player: Player):
@@ -57,10 +63,106 @@ class Targets:
         for n in sorted(failed, reverse=True):
             del self.player.data.get("targets", [])[n]
 
+class Class:
+    def __init__(self, data: dict):
+        self.data = data
+    
+    def get(self, id: str):
+        indexs = id.split(".")
+        data = self.data
+        for index in indexs:
+            data = data.get(index)
+            if data is None:
+                return None
+        
+        return data
+    
+    @property
+    def type(self) -> str:
+        return self.get("type").lower()
+    @property
+    def total_level(self) -> int:
+        return self.get("level")
+    @property
+    def combat_level(self) -> int:
+        return self.get("professions.combat.level")
+
+class Stats:
+    def __init__(self, data: dict):
+        self.data = data
+    
+    def get(self, id: str):
+        indexs = id.split(".")
+        data = self.data
+        for index in indexs:
+            data = data.get(index)
+            if data is None:
+                return None
+        
+        return data
+    
+    @property
+    def first_join(self) -> datetime.datetime:
+        """First time the player joined"""
+        raw_date = self.get("meta.firstJoin")
+        return datetime.datetime.strptime(
+            raw_date,
+            "%Y-%m-%dT%H:%M:%S.%fZ", # ISO Format
+        )
+    @property
+    def last_join(self) -> datetime.datetime:
+        """Last time the player has been seen on the server"""
+        raw_date = self.get("meta.firstJoin")
+        return datetime.datetime.strptime(
+            raw_date,
+            "%Y-%m-%dT%H:%M:%S.%fZ", # ISO Format
+        )
+    
+    @property
+    def online(self) -> bool:
+        """Whether the player is online or not"""
+        return self.get("meta.location.online")
+    @property
+    def server(self) -> str:
+        """If online, the server the player is on, else None"""
+        return self.get("meta.location.server")
+
+    @property
+    def total_levels(self) -> int:
+        """The total levels the player has
+        (Combat and professions)
+        """
+        return self.get("global.totalLevel.combined")
+    @property
+    def total_playtime(self) -> datetime.timedelta:
+        return datetime.timedelta(
+            hours=self.get("meta.playtime")/12 # for some weird reason it seems like there is 12 minutes in one hour...
+        )
+    @property
+    def total_mob_kills(self) -> int:
+        return self.get("global.mobsKilled")
+    
+    @property
+    def guild_name(self) -> str | None:
+        return self.get("guild.name")
+    
+    @property
+    def classes(self) -> list[Class]:
+        classes = []
+
+        for class_ in self.get("characters").values():
+            classes.append(Class(class_))
+        
+        return classes
+
 class Player:
     def __init__(self, data: dict, parent: Players):
         self.data = data
         self.parent = parent
+        self.load_stats()
+
+    def load_stats(self):
+        self.stats = Stats(self.data.get("stats", {}))
     
     @property
     def name(self) -> str | None:
@@ -73,13 +175,6 @@ class Player:
     @property
     def uuid(self) -> str | None:
         return self.data.get("uuid")
-    
-    @uuid.setter
-    def uuid(self, value: str):
-        if self.uuid is None:
-            self.data["uuid"] = value
-        else:
-            raise ValueError("You cannot edit the UUID")
     
     @property
     def wynncraft_stats(self) -> dict:
@@ -96,14 +191,46 @@ class Player:
             self.data["stats"] = stats
             self.data["name"] = stats.get("username")
             self.data["uuid"] = stats.get("uuid")
+            self.load_stats()
     
     def get_embed(self) -> discord.Embed:
+        description = f"""**Total levels** {self.stats.total_levels}
+        **Total playtime** {convert_timedelta(self.stats.total_playtime)}
+
+        **Guild** {self.stats.guild_name or "No guild"}"""
         embed = discord.Embed(
-            title=f"{self.name or self.uuid}"
+            title=self.name,
+            description=description,
+            color=12233344, # wynncraft website background
         )
-        if self.data.get("stats", {}).get("uuid") is not None:
-            embed.add_field(name="UUID", value=self.data.get("stats", {}).get("uuid"))
+
+        embed.set_thumbnail(url=f"https://visage.surgeplay.com/bust/{self.uuid}")
+
+        if not self.stats.online:
+            embed.set_footer(
+                text="Last seen",
+            )
+            embed.timestamp = self.stats.last_join
+        
         return embed
+    
+    def get_large_embed(self) -> discord.Embed:
+        embed = self.get_embed()
+        embed.description += """
+        
+        **Characters**"""
+
+        for i, class_ in enumerate(self.stats.classes):
+            class_name = EMOJIS.get(class_.type, "") + " " + class_.type.capitalize()
+            embed.add_field(
+                name=class_name,
+                value=f"""Combat: {class_.combat_level}
+                Total: {class_.total_level}""",
+                inline=i%3!=0 or i==0, # go to the next line each 3 classes
+            )
+        
+        return embed
+
 
 class Players(Storage):
     players: list[Player]
@@ -160,6 +287,30 @@ class PlayerCommandGroup(app_commands.Group):
             await inter.response.send_message(embeds=embeds)
         else:
             await inter.response.send_message("Nothing to show here...")
+    
+    @app_commands.command(
+        name="show",
+        description="Show the stats of a player",
+    )
+    @app_commands.describe(
+        name="The player to lookup",
+    )
+    #@app_commands.autocomplete()
+    async def show(
+        self,
+        inter: discord.Interaction,
+        name: str,
+    ):
+        for player in self.players:
+            if player.name.lower() == name.lower():
+                break
+        else:
+            await inter.response.send_message("User not found")
+            return
+        
+        await inter.response.send_message(
+            embed = player.get_large_embed(),
+        )
     
     @app_commands.command(
         name="create",
@@ -239,7 +390,7 @@ class PlayerCommandGroup(app_commands.Group):
 
             await inter.edit_original_response(
                 content=":white_check_mark: The player has been created!",
-                embed=player.get_embed(),
+                embed=player.get_large_embed(),
             )
 
 class Wynncraft(commands.Cog):
