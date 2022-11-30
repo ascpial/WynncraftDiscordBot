@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Generator, Union
+from typing import Generator, Union
 import urllib.error # to catch 400 errors (user does not exists)
 import datetime
 import logging
@@ -60,7 +60,7 @@ class Targets:
             
             return user.dm_channel
 
-    async def __iter__(
+    async def __aiter__(
         self
     ) -> Generator[Union[discord.TextChannel, discord.DMChannel]]:
         failed = []
@@ -299,6 +299,12 @@ class Players(Storage):
 
         self.data.append(player.data)
         self.players.append(player)
+    
+    def get_player(self, name_or_uuid: str) -> Player | None:
+        """Returns a player by name or UUID if he is already fetched in the database."""
+        for player in self.players:
+            if player.name == name_or_uuid or player.uuid == name_or_uuid:
+                return player
 
     def load_players(self):
         players = []
@@ -321,6 +327,8 @@ class Players(Storage):
         return iter(self.players)
 
 class PlayerCommandGroup(app_commands.Group):
+    players: Players
+
     def __init__(self, bot: Client, cog: Wynncraft):
         super().__init__(
             name="players",
@@ -343,9 +351,8 @@ class PlayerCommandGroup(app_commands.Group):
         name: str,
     ):
         await inter.response.defer(thinking=True)
-        try:
-            player = self.players.new_player(name) # the function returns the player from the database if it has already been fetched
-        except ValueError:
+        player = await self.cog.get_player(name)
+        if player is None:
             await inter.edit_original_response(
                 content=f":confused: I found no user corresponding to the search `{name}`..."
             )
@@ -353,7 +360,219 @@ class PlayerCommandGroup(app_commands.Group):
             await inter.edit_original_response(
                 embed=player.get_large_embed(),
             )
+
+    @app_commands.command(
+        name="subscribe",
+        description="Send notifications somewhere when the player logs in.",
+    )
+    @app_commands.describe(
+        name="The name of the player to follow.",
+        channel="The channel targeted by the notifications.",
+        dm="Set to true to receive notifications in direct messages."
+    )
+    async def subscribe(
+        self,
+        inter: discord.Interaction,
+        name: str,
+        channel: discord.TextChannel = None,
+        dm: bool = False,
+    ):
+        if channel is None and dm is False:
+            await inter.response.send(":x: Specify at least one target (channel or DM).")
+            return
+        
+        await inter.response.defer()
+
+        player = await self.cog.get_player(name)
+
+        if player is None:
+            await inter.edit_original_response(
+                content=f":confused: I found no user corresponding to the search `{name}`..."
+            )
+            return
+        
+        new_targets = []
+
+        targets_strings = []
+        
+        if channel is not None:
+            if channel.id not in (target.get("id") for target in player.targets.raw_targets):
+                new_targets.append(
+                    {
+                        "type": 0, # text channel
+                        "id": channel.id,
+                    }
+                )
+            targets_strings.append(f"in the channel {channel.mention}")
+
+        if dm:
+            if inter.user.id not in (target.get("id") for target in player.targets.raw_targets):
+                new_targets.append(
+                    {
+                        "type": 1, # dm channel
+                        "id": inter.user.id,
+                    }
+                )
+            targets_strings.append(f"in your DMs")
+        
+        player.data["targets"] = player.targets.raw_targets + new_targets
+        self.players.save()
+
+        targets_string = " and ".join(targets_strings)
+        
+        await inter.edit_original_response(
+            content=f"The notifications will be send {targets_string}!"
+        )
     
+    @app_commands.command(
+        name="unsubscribe",
+        description="Remove player notification in a channel.",
+    )
+    @app_commands.describe(
+        name="The name of the user to unsubscribe.",
+        channel="Unsubscribe this channel",
+        dm="Set to true to unsubscribe you from notifications",
+    )
+    async def unsubscribe(
+        self,
+        inter: discord.Interaction,
+        name: str,
+        channel: discord.TextChannel = None,
+        dm: bool = False,
+    ):
+        if channel is None and dm is False:
+            await inter.response.send_message("Specify a channel or a DM channel.")
+            return
+        
+        player = self.players.get_player(name)
+        if player is None: # player not in database
+            await inter.response.send_message(f"Nothing is subscribed to the player `{name}`.")
+            return
+        
+        if len(player.targets.raw_targets) == 0:
+            await inter.response.send_message(f"Nothing is subscribed to the player `{player.name}`.")
+            return
+        
+        removed_targets = []
+        to_remove_targets_index = []
+        for i, target in enumerate(player.targets.raw_targets):
+            if channel is not None and target["id"] == channel.id:
+                to_remove_targets_index.append(i)
+                removed_targets.append(f"the channel {channel.mention}")
+            if dm is True and target["id"] == inter.user.id:
+                to_remove_targets_index.append(i)
+                removed_targets.append(f"your DM")
+        
+        for i in sorted(to_remove_targets_index, reverse=True):
+            del player.data["targets"][i]
+        
+        self.players.save()
+        
+        if len(removed_targets) > 0:
+            removed_targets_string = " and ".join(removed_targets)
+            await inter.response.send_message(
+                f"I successfully unsubscribed {removed_targets_string}!",
+            )
+        else:
+            await inter.response.send_message(
+                f"The specified targets where not subscribed."
+            )
+    
+    @app_commands.command(
+        name="subscribed",
+        description="Show the list of channels subscribed to an user.",
+    )
+    @app_commands.describe(
+        name="The user to look for subscribers.",
+    )
+    async def subscribed(
+        self,
+        inter: discord.Interaction,
+        name: str,
+    ):
+        player = self.players.get_player(name)
+        if player is None: # player not in database
+            await inter.response.send_message(f"Nothing is subscribed to the player `{name}`.")
+            return
+        
+        if len(player.targets.raw_targets) == 0:
+            await inter.response.send_message(f"Nothing is subscribed to the player `{player.name}`.")
+            return
+        
+        embed = player.get_embed()
+
+        subscriptions_string = ""
+        for raw_target in player.targets.raw_targets:
+            if raw_target.get("type", 0) == 0: # textchannel
+                subscriptions_string += f"<#{raw_target['id']}>\n"
+            else: # user
+                subscriptions_string += f"<@{raw_target['id']}>\n"
+
+        embed.add_field(
+            name="Subscribed to notifications",
+            value=subscriptions_string,
+        )
+
+        await inter.response.send_message(embed=embed)
+    
+    @app_commands.command(
+        name="forget",
+        description="Remove a player from the database",
+    )
+    @app_commands.describe(
+        name="The user to remove from the database."
+    )
+    async def forget(
+        self,
+        inter: discord.Interaction,
+        name: str,
+    ):
+        player = self.players.get_player(name)
+        if player is None: # player not in database
+            await inter.response.send_message(f"I don't know the player `{name}`. Does he exists?")
+            return
+        
+        if len(player.targets.raw_targets) > 0:
+            await inter.response.send_message(f"Remove subscriptions to the player `{player.name}` before I can forget he.")
+            return
+        
+        for player_index, player_ in enumerate(self.players):
+            if player_ is player:
+                break
+        else:
+            await inter.response.send_message(f"I did no found the player `{player.name}`... It's strange.")
+            return
+        
+        del self.players.data[player_index]
+        self.players.load_players()
+        self.players.save()
+        
+        await inter.response.send_message(
+            f"Was the player `{player.name}` that ugly? Anyway, I already forget about him."
+        )
+
+    @forget.autocomplete("name")
+    @unsubscribe.autocomplete("name")
+    @subscribed.autocomplete("name")
+    async def fetched_player_autocomplete(
+        self,
+        inter: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice(str)]:
+        choices = []
+        
+        for player in self.players:
+            if current.lower() in player.name.lower():
+                choices.append(
+                    app_commands.Choice(
+                        name=player.name,
+                        value=player.name,
+                    )
+                )
+        
+        return choices
+
+    @subscribe.autocomplete("name")
     @show.autocomplete("name")
     async def player_autotomplete(
         self,
@@ -394,6 +613,12 @@ class Wynncraft(commands.Cog):
         self.player_commands = PlayerCommandGroup(self.bot, self)
         self.bot.tree.add_command(self.player_commands)
     
+    async def get_player(self, name: str) -> Player | None:
+        try:
+            return self.players.new_player(name) # the function returns the player from the database if it has already been fetched
+        except ValueError:
+            return None
+    
     @tasks.loop(seconds=30) # as the wynncraft API cache is 5 minutes, 30 seconds loop is more than enough
     async def refresh(self):
         """Refresh one player at a time."""
@@ -412,14 +637,15 @@ class Wynncraft(commands.Cog):
             player.refresh()
 
             logging.info(f"Player {player.name} refreshed")
+            print(was_online, player.stats.online)
 
-            if was_online is not player.stats.online: # the user connected or disconnected
+            if was_online != player.stats.online: # the user connected or disconnected
                 if player.stats.online:
-                    message = f"{player.name} just logged into {player.stats.server}!"
+                    message = f"{player.name} just logged into `{player.stats.server}`!"
                 else:
                     message = f"{player.name} logged out."
-                embed = await player.get_embed()
-                for channel in player.targets:
+                embed = player.get_embed()
+                async for channel in player.targets:
                     await channel.send(
                         content=message,
                         embed=embed,
