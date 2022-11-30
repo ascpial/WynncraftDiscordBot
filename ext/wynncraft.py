@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional, Generator, Union
 import urllib.error # to catch 400 errors (user does not exists)
 import datetime
-import log
+import logging
 
 import discord
 from discord.ext import commands
@@ -15,6 +15,12 @@ from discord import app_commands
 import wynncraft
 
 from utils import Client, Storage, convert_timedelta
+
+# Setup logging
+
+from discord.utils import setup_logging
+
+setup_logging() # colored output like discord.py
 
 EMOJIS = {
     "assassin": "<:assassin:1047260394227499098>",
@@ -112,18 +118,20 @@ class Stats:
     def first_join(self) -> datetime.datetime:
         """First time the player joined"""
         raw_date = self.get("meta.firstJoin")
-        return datetime.datetime.strptime(
-            raw_date,
-            "%Y-%m-%dT%H:%M:%S.%fZ", # ISO Format
-        )
+        return datetime.datetime.fromisoformat(raw_date)
+        # return datetime.datetime.strptime(
+        #     raw_date,
+        #     "%Y-%m-%dT%H:%M:%S.%fZ", # ISO Format
+        # )
     @property
     def last_join(self) -> datetime.datetime:
         """Last time the player has been seen on the server"""
         raw_date = self.get("meta.firstJoin")
-        return datetime.datetime.strptime(
-            raw_date,
-            "%Y-%m-%dT%H:%M:%S.%fZ", # ISO Format
-        )
+        return datetime.datetime.fromisoformat(raw_date)
+        # return datetime.datetime.strptime(
+        #     raw_date,
+        #     "%Y-%m-%dT%H:%M:%S.%fZ", # ISO Format
+        # )
     
     @property
     def online(self) -> bool:
@@ -143,7 +151,7 @@ class Stats:
     @property
     def total_playtime(self) -> datetime.timedelta:
         return datetime.timedelta(
-            hours=self.get("meta.playtime")/12 # for some weird reason it seems like there is 12 minutes in one hour...
+            hours=self.get("meta.playtime")/60*4.7 # see https://github.com/Wynncraft/WynncraftAPI/issues/56
         )
     @property
     def total_mob_kills(self) -> int:
@@ -188,6 +196,17 @@ class Player:
     def wynncraft_stats(self) -> dict:
         return self.data.get("stats", {})
     
+    @property
+    def last_fetched(self) -> datetime.datetime:
+        last_timestamp = self.data.get("last_fetched")
+        if last_timestamp is not None:
+            return datetime.datetime.fromtimestamp(last_timestamp)
+        else:
+            return None
+    @last_fetched.setter
+    def last_fetched(self, new_date: datetime.datetime):
+        self.data["last_fetched"] = int(new_date.timestamp())
+    
     def refresh(self):
         identifier = self.uuid or self.name
         try:
@@ -199,6 +218,7 @@ class Player:
             self.data["stats"] = stats
             self.data["name"] = stats.get("username")
             self.data["uuid"] = stats.get("uuid")
+            self.last_fetched = datetime.datetime.now()
             self.load_stats()
     
     def get_embed(self) -> discord.Embed:
@@ -248,9 +268,33 @@ class Players(Storage):
         super().__init__("./players.json", default=[])
         self.cog = cog
     
+    def new_player(self, name_or_uuid: str) -> Player:
+        """Fetch and create a new player in the database.
+        Returns the value from the database if the player is already in it.
+        """
+        
+        for player in self.players:
+            if player.name == name_or_uuid or player.uuid == name_or_uuid: # the user has already been fetched
+                return player
+
+        logging.info(f"Fetching the new user `{name_or_uuid}`")
+
+        player = Player({"uuid": name_or_uuid}, self) # for now the field being name or uuid doesn't matters, it will be overwritten when fetched
+
+        try:
+            player.refresh()
+        except ValueError: # the username or UUID is invalid
+            raise ValueError("The player name or UUID is invalid or the player doesn't exists.")
+
+        self.add_player(player) # we don't need to handle the "already exist error" as the check as already been done
+
+        self.save()
+
+        return player
+
     def add_player(self, player: Player):
-        for player in self.data:
-            if player.get("uuid") == player.uuid:
+        for player_ in self.data:
+            if player_.get("uuid") == player.uuid:
                 raise ValueError("A user with this UUID already exists")
 
         self.data.append(player.data)
@@ -287,133 +331,55 @@ class PlayerCommandGroup(app_commands.Group):
         self.players = self.cog.players
     
     @app_commands.command(
-        name="list",
-        description="List all tracked players",
-    )
-    async def list(self, inter: discord.Interaction):
-        embeds = []
-        for player in self.players:
-            embeds.append(player.get_embed())
-        
-        if len(embeds) > 0:
-            await inter.response.send_message(embeds=embeds)
-        else:
-            await inter.response.send_message("Nothing to show here...")
-    
-    @app_commands.command(
         name="show",
-        description="Show the stats of a player",
+        description="Show the stats of a player.",
     )
     @app_commands.describe(
         name="The player to lookup",
     )
-    #@app_commands.autocomplete()
     async def show(
         self,
         inter: discord.Interaction,
         name: str,
     ):
-        for player in self.players:
-            if player.name.lower() == name.lower():
-                break
+        await inter.response.defer(thinking=True)
+        try:
+            player = self.players.new_player(name) # the function returns the player from the database if it has already been fetched
+        except ValueError:
+            await inter.edit_original_response(
+                content=f":confused: I found no user corresponding to the search `{name}`..."
+            )
         else:
-            await inter.response.send_message("User not found")
-            return
-        
-        await inter.response.send_message(
-            embed = player.get_large_embed(),
-        )
+            await inter.edit_original_response(
+                embed=player.get_large_embed(),
+            )
     
-    @app_commands.command(
-        name="create",
-        description="Create a new player",
-    )
-    @app_commands.describe(
-        name="The name of the player to track.",
-        uuid="The UUID of the player to track.",
-        target="The channel in which to send notifications.",
-        dm="Whether to send notifications in private messages or not."
-    )
-    async def create(
+    @show.autocomplete("name")
+    async def player_autotomplete(
         self,
         inter: discord.Interaction,
-        name: Optional[str] = None,
-        uuid: Optional[str] = None,
-        target: Optional[discord.TextChannel] = None,
-        dm: bool = False,
-    ):
-        if (name is None and uuid is None) or (name is not None and uuid is not None):
-            await self.bot.send_error(
-                inter,
-                "Specify only name or only UUID.",
-            )
-            return
+        current: str,
+    ) -> list[app_commands.Choice(str)]:
+        choices = []
         
-        # TODO add regex check for UUID : xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        # should be simple lol
-        
-        if target is None and dm is False:
-            await self.bot.send_error(
-                inter,
-                "Specify at least one target (DM or channel).",
-            )
-            return
-        
-        await inter.response.defer(ephemeral=True)
-        
-        targets = []
-
-        if target is not None:
-            targets.append(
-                {
-                    "type": 0,
-                    "id": target.id,
-                }
+        if len(current) > 0:
+            choices.append(
+                app_commands.Choice(
+                    name=f"Fetch player: {current}",
+                    value=current,
+                )
             )
         
-        if dm:
-            targets.append(
-                {
-                    "type": 1,
-                    "id": inter.user.id,
-                }
-            )
-        
-        data = {
-            "targets": targets
-        }
-        if name is not None:
-            data["name"] = name
-        if uuid is not None:
-            data["uuid"] = uuid
-        
-        player = Player(data, self.players)
-
-        try:
-            player.refresh()
-        except ValueError: # the username or UUID is invalid
-            await inter.edit_original_response(
-                content=":negative_squared_cross_mark: The player could not be found.",
-            )
-            return
-        
-        try:
-            self.players.add_player(player)
-        except ValueError: # the player already exists
-            for player_ in self.players:
-                if player.uuid == player_.uuid:
-                    await inter.edit_original_response(
-                        content=":negative_squared_cross_mark: The player already exists.",
-                        embed=player_.get_large_embed(),
+        for player in self.players:
+            if current.lower() in player.name.lower():
+                choices.append(
+                    app_commands.Choice(
+                        name=player.name,
+                        value=player.name,
                     )
-                    return
-
-        self.players.save()
-
-        await inter.edit_original_response(
-            content=":white_check_mark: The player has been created!",
-            embed=player.get_large_embed(),
-        )
+                )
+        
+        return choices
 
 class Wynncraft(commands.Cog):
     def __init__(
@@ -427,20 +393,25 @@ class Wynncraft(commands.Cog):
 
         self.player_commands = PlayerCommandGroup(self.bot, self)
         self.bot.tree.add_command(self.player_commands)
-
-        self.current_player_index = 0
     
-    @tasks.loop(seconds=5)
+    @tasks.loop(seconds=30) # as the wynncraft API cache is 5 minutes, 30 seconds loop is more than enough
     async def refresh(self):
         """Refresh one player at a time."""
-        if len(self.players.players) > self.current_player_index:
-            player = self.players.players[self.current_player_index]
-            
+        # 5 minutes ago (to calculate wynncraft cache)
+        last_refreshed = datetime.datetime.fromtimestamp(
+            datetime.datetime.now().timestamp() - 5*60 # 5 minutes ago
+        )
+
+        for player in self.players:
+            if len(player.targets.raw_targets) == 0: # we skip if the user is not tracked
+                continue
+            if player.last_fetched > last_refreshed: # we skip if we fetched the player less than 5 minutes ago
+                continue
             was_online = player.stats.online
 
             player.refresh()
 
-            log.info(f"Player {player.name} refreshed")
+            logging.info(f"Player {player.name} refreshed")
 
             if was_online is not player.stats.online: # the user connected or disconnected
                 if player.stats.online:
@@ -453,10 +424,6 @@ class Wynncraft(commands.Cog):
                         content=message,
                         embed=embed,
                     )
-            
-            self.current_player_index += 1
-            if self.current_player_index >= len(self.players.players):
-                self.current_player_index = 0
 
 async def setup(bot: Client):
     await bot.add_cog(Wynncraft(bot))
