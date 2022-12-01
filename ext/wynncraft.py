@@ -14,6 +14,9 @@ from discord import app_commands
 
 import wynncraft
 
+# Remove wynncraft.py rate limit implementation, let's use our own instead
+wynncraft.CACHE_TIME = 0
+
 from utils import Client, Storage, convert_timedelta
 
 # Setup logging
@@ -201,7 +204,7 @@ class Player:
     def last_fetched(self) -> datetime.datetime:
         last_timestamp = self.data.get("last_fetched")
         if last_timestamp is not None:
-            return datetime.datetime.fromtimestamp(last_timestamp)
+            return datetime.datetime.utcfromtimestamp(last_timestamp)
         else:
             return None
     @last_fetched.setter
@@ -209,38 +212,43 @@ class Player:
         self.data["last_fetched"] = int(new_date.timestamp())
     @property
     def next_fetch(self) -> datetime.datetime:
-        last_timestamp = self.data.get("last_fetched")
-        if last_timestamp is not None:
-            return datetime.datetime.fromtimestamp(
-                last_timestamp + PLAYER_CACHE_TIME,
+        if self.last_fetched is not None:
+            return datetime.datetime.utcfromtimestamp(
+                self.last_fetched.timestamp() + PLAYER_CACHE_TIME,
             )
         else:
             return None
     
     def refresh(self):
-        identifier = self.uuid or self.name
-        try:
-            # the response contains metadata and the data is in a list
-            raw_stats = wynncraft.Player.stats(identifier)
-        except urllib.error.HTTPError:
-            raise ValueError("The username or UUID is invalid")
-        else:
-            stats = raw_stats["data"][0]
-            self.data["stats"] = stats
-            self.data["name"] = stats.get("username")
-            self.data["uuid"] = stats.get("uuid")
-            self.last_fetched = datetime.datetime.from_timestamp(
-                raw_stats.get(
-                    "timestamp"
-                ) / 1000 # the timestamp is in milliseconds
-            )
-            self.load_stats()
+        """Refreshes the player data.
+        If new data cannot be fetched (which means no new data can be fetched
+        from the API because of the cache), the function does nothing.
+        """
+        if self.next_fetch is None or self.next_fetch <= datetime.datetime.utcnow(): # only refresh if new data are available
+            identifier = self.uuid or self.name
+            try:
+                # the response contains metadata and the data is in a list
+                raw_stats = wynncraft.Player.stats(identifier)
+            except urllib.error.HTTPError:
+                raise ValueError("The username or UUID is invalid")
+            else:
+                stats = raw_stats["data"][0]
+                self.data["stats"] = stats
+                self.data["name"] = stats.get("username")
+                self.data["uuid"] = stats.get("uuid")
+                self.last_fetched = datetime.datetime.utcfromtimestamp(
+                    raw_stats.get(
+                        "timestamp"
+                    ) / 1000 # the timestamp is in milliseconds
+                ) # this is the correct value to calculate the next update
+                self.load_stats()
+                logging.info(f"Player {self.name} refreshed")
     
     def get_embed(self) -> discord.Embed:
-        description = f"""**Total levels** {self.stats.total_levels}
-        **Total playtime** {convert_timedelta(self.stats.total_playtime)}
+        description = f"**Total levels** {self.stats.total_levels}\n"
+        description += f"**Total playtime** {convert_timedelta(self.stats.total_playtime)}\n"
+        description += f"**Guild** {self.stats.guild_name or 'No guild'}"
 
-        **Guild** {self.stats.guild_name or "No guild"}"""
         embed = discord.Embed(
             title=self.name,
             description=description,
@@ -254,14 +262,16 @@ class Player:
                 text="Last seen",
             )
             embed.timestamp = self.stats.last_join
+        else:
+            embed.set_footer(
+                text=f"Connected on {self.stats.server}",
+            )
         
         return embed
     
     def get_large_embed(self) -> discord.Embed:
         embed = self.get_embed()
-        embed.description += """
-
-        **Characters**"""
+        embed.description += """\n\n**Characters**"""
 
         for i, class_ in enumerate(self.stats.classes):
             class_name = EMOJIS.get(class_.type, "") + " " + class_.type.capitalize()
@@ -271,6 +281,12 @@ class Player:
                 Total: {class_.total_level}""",
                 inline=i%3!=0 or i==0, # go to the next line each 3 classes
             )
+        
+        embed.add_field(
+            name="Next refresh",
+            value=f"Next stats refresh possible <t:{int(self.next_fetch.timestamp())}:R>",
+            inline=False,
+        ) # show the time until new data can be fetched
         
         return embed
 
@@ -643,18 +659,11 @@ class Wynncraft(commands.Cog):
         """
 
         for player in self.players:
-            if player.last_fetched is None or player.next_fetch < datetime.datetime.now():
-                print("not refreshed enough")
-                continue
-        
+            was_online = player.stats.online
+            
+            player.refresh() # cache is handled by the function
+
             if len(player.targets.raw_targets) > 0: # channels are subscribed to login / logout messages
-                was_online = player.stats.online
-
-                player.refresh()
-
-                logging.info(f"Player {player.name} refreshed")
-                print(was_online, player.stats.online)
-
                 if was_online != player.stats.online: # the user connected or disconnected
                     if player.stats.online:
                         message = f"{player.name} just logged into `{player.stats.server}`!"
