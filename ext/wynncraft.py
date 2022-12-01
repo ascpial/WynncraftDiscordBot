@@ -29,6 +29,7 @@ EMOJIS = {
     "mage": "<:mage:1047429596926201906>",
     "shaman": "<:shaman:1047429595323965451>",
 }
+PLAYER_CACHE_TIME = 1800
 
 class Targets:
     def __init__(self, player: Player):
@@ -206,19 +207,33 @@ class Player:
     @last_fetched.setter
     def last_fetched(self, new_date: datetime.datetime):
         self.data["last_fetched"] = int(new_date.timestamp())
+    @property
+    def next_fetch(self) -> datetime.datetime:
+        last_timestamp = self.data.get("last_fetched")
+        if last_timestamp is not None:
+            return datetime.datetime.fromtimestamp(
+                last_timestamp + PLAYER_CACHE_TIME,
+            )
+        else:
+            return None
     
     def refresh(self):
         identifier = self.uuid or self.name
         try:
             # the response contains metadata and the data is in a list
-            stats = wynncraft.Player.stats(identifier)["data"][0]
+            raw_stats = wynncraft.Player.stats(identifier)
         except urllib.error.HTTPError:
             raise ValueError("The username or UUID is invalid")
         else:
+            stats = raw_stats["data"][0]
             self.data["stats"] = stats
             self.data["name"] = stats.get("username")
             self.data["uuid"] = stats.get("uuid")
-            self.last_fetched = datetime.datetime.now()
+            self.last_fetched = datetime.datetime.from_timestamp(
+                raw_stats.get(
+                    "timestamp"
+                ) / 1000 # the timestamp is in milliseconds
+            )
             self.load_stats()
     
     def get_embed(self) -> discord.Embed:
@@ -619,37 +634,43 @@ class Wynncraft(commands.Cog):
         except ValueError:
             return None
     
-    @tasks.loop(seconds=30) # as the wynncraft API cache is 5 minutes, 30 seconds loop is more than enough
+    @tasks.loop(seconds=30) # the API fetch will only be done when the cache expires, so 30 seconds is fine
     async def refresh(self):
-        """Refresh one player at a time."""
-        # 5 minutes ago (to calculate wynncraft cache)
-        last_refreshed = datetime.datetime.fromtimestamp(
-            datetime.datetime.now().timestamp() - 5*60 # 5 minutes ago
-        )
+        """Refresh stored players and send login and logout messages in
+        consequence.
+        The API fetch is only done when the cache expires to avoid rate limit
+        issues.
+        """
 
         for player in self.players:
-            if len(player.targets.raw_targets) == 0: # we skip if the user is not tracked
+            if player.last_fetched is None or player.next_fetch < datetime.datetime.now():
+                print("not refreshed enough")
                 continue
-            if player.last_fetched > last_refreshed: # we skip if we fetched the player less than 5 minutes ago
-                continue
-            was_online = player.stats.online
+        
+            if len(player.targets.raw_targets) > 0: # channels are subscribed to login / logout messages
+                was_online = player.stats.online
 
-            player.refresh()
+                player.refresh()
 
-            logging.info(f"Player {player.name} refreshed")
-            print(was_online, player.stats.online)
+                logging.info(f"Player {player.name} refreshed")
+                print(was_online, player.stats.online)
 
-            if was_online != player.stats.online: # the user connected or disconnected
-                if player.stats.online:
-                    message = f"{player.name} just logged into `{player.stats.server}`!"
-                else:
-                    message = f"{player.name} logged out."
-                embed = player.get_embed()
-                async for channel in player.targets:
-                    await channel.send(
-                        content=message,
-                        embed=embed,
-                    )
+                if was_online != player.stats.online: # the user connected or disconnected
+                    if player.stats.online:
+                        message = f"{player.name} just logged into `{player.stats.server}`!"
+                    else:
+                        message = f"{player.name} logged out."
+                    embed = player.get_embed()
+                    async for channel in player.targets:
+                        try:
+                            await channel.send(
+                                content=message,
+                                embed=embed,
+                            )
+                        except discord.Forbidden:
+                            logging.warn(
+                                f"Cannot send message in {channel.mention}"
+                            )
 
 async def setup(bot: Client):
     await bot.add_cog(Wynncraft(bot))
